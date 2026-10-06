@@ -24,6 +24,9 @@ using std::string;
 int reg_ready[REG_LAST];
 REG rd[2];
 
+REG q2_rd[2];
+bool q2_isLoad[2] = {false, false};
+
 int insCount    = 0; //number of dynamically executed instructions
 int loads       = 0;
 int lduh        = 0;
@@ -65,6 +68,7 @@ int storeValueOp)
     loads++;
   }
 
+  int current_stalls_q2 = 0;
 
   for (int i = 0; (size_t)i < srcs->size(); i++) {
     if (i != storeValueOp && reg_ready[(*srcs)[i]] > insCount) {
@@ -72,6 +76,7 @@ int storeValueOp)
       break;
     }
 
+    // Q1 (5-stage, no forwarding)
     if((*srcs)[i] == rd[0]) {
       stalls_q1 += 2;
       double_stalls++;
@@ -84,10 +89,36 @@ int storeValueOp)
       rd[1] = REG_INVALID_;
     }
 
+    //Q2 (6-stage, full forwarding)
+    // dist 1 (immediate predecessor)
+    if((*srcs)[i] == q2_rd[0]) {
+      if (q2_isLoad[0]) {
+          current_stalls_q2 = std::max(current_stalls_q2, 2); // load -> 2 stalls
+      } else {
+          current_stalls_q2 = std::max(current_stalls_q2, 1); // ALU -> 1 stall
+      }
+      q2_rd[0] = REG_INVALID_; // Clear to prevent double counting
+    }
+    
+    // dist 2 (separated by 1 instruction)
+    if((*srcs)[i] == q2_rd[1]) {
+      if (q2_isLoad[1]) {
+          current_stalls_q2 = std::max(current_stalls_q2, 1); // load -> 1 stall
+      } 
+      // ALU at distance 2 is 0 stalls, so we do nothing
+      q2_rd[1] = REG_INVALID_;
+    }
   }
+
+  stalls_q2 += current_stalls_q2;
 
   rd[1] = rd[0];
   rd[0] = REG_INVALID_;
+
+  q2_rd[1] = q2_rd[0];
+  q2_isLoad[1] = q2_isLoad[0];
+  q2_rd[0] = REG_INVALID_;
+  q2_isLoad[0] = false;
 
   for (REG dst : *dsts) {
     if (isLoad) {
@@ -95,6 +126,8 @@ int storeValueOp)
     }
 
     rd[0] = dst;
+    q2_rd[0] = dst;
+    q2_isLoad[0] = isLoad;
   }
 
 
@@ -148,10 +181,20 @@ VOID Fini(INT32 code, VOID* v)
     cerr << "Number of instructions: " << insCount << endl;
     cerr << "Number of load instructions: " << loads << endl;
     cerr << "Number of load-to-use hazards: " << lduh << endl;
-    fprintf(stderr, "Question 1 stall cycles: %d CPI %lf slowdown: %lf%%\n", stalls_q1, 1.0 + (float) stalls_q1 / insCount, (float)(float(stalls_q1 / (float(insCount + stalls_q1))) * 100.0));
-    fprintf(stderr, "Question 2 stall cycles: %d CPI %lf slowdown: %lf%%\n", stalls_q2, 0.0, 0.0);
     cerr << "===============================================" << endl;
 
+    // Q1
+    fprintf(stderr, "Question 1 stall cycles: %d CPI %lf slowdown: %lf%%\n",
+            stalls_q1,
+            1.0 + (float) stalls_q1 / insCount,
+            (float)(float(stalls_q1 / (float(insCount + stalls_q1))) * 100.0));
+    cerr << "===============================================" << endl;
+    // Q2
+    fprintf(stderr, "Question 2 stall cycles: %d CPI %lf slowdown: %lf%%\n",
+            stalls_q2,
+            1.0 + (float) stalls_q2 / insCount,
+            (float)(float(stalls_q2 / (float(insCount + stalls_q2))) * 100.0));
+    cerr << "===============================================" << endl;
     fprintf(stderr, "Single Stalls: %d\nDouble Stalls: %d\n", single_stalls, double_stalls);
 }
 
