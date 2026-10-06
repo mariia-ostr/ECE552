@@ -12,11 +12,12 @@ int main(int argc, char **argv)
   int d = 10;
 
   for (int i = 0; i < iterations; ++i) {
-    register int e = a + b;
-    e += a + b;
-    e += a + b;
-    a = a + b;
-    d = e + d;
+    register int e = a + b; // Write E
+    e += a + b; // Use E -> Double cycle stall
+    e += a + b; // Use E -> Double cycle stall
+    a = a + b;  // Write A
+    d = e + d; // E stalls one cycle
+    // Two double cycle stalls, One single cycle stall
   }
 
   return 0;
