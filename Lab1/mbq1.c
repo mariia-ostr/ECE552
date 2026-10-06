@@ -9,11 +9,14 @@ int main(int argc, char **argv)
 
   register int a = 1;
   register int b = 1;
+  int d = 10;
 
   for (int i = 0; i < iterations; ++i) {
-    const register int c = a + b;
-    a = b - c;
-    b = a + c;
+    register int e = a + b;
+    e += a + b;
+    e += a + b;
+    a = a + b;
+    d = e + d;
   }
 
   return 0;
