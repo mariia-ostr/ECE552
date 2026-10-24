@@ -3,7 +3,7 @@
 #define PREDICTOR_BITS 8192
 #define BRANCH_BITS 2
 constexpr int TABLE_ENTRY_COUNT = PREDICTOR_BITS / BRANCH_BITS;
-constexpr int INDEX_BITS = 11;
+constexpr int INDEX_BITS = 12;
 constexpr unsigned int INDEX_MASK = (1 << (INDEX_BITS)) - 1;
 
 enum branch_state {
