@@ -4,7 +4,7 @@
 #define BRANCH_BITS 2
 constexpr int TABLE_ENTRY_COUNT = PREDICTOR_BITS / BRANCH_BITS;
 constexpr int INDEX_BITS = 11;
-constexpr unsigned int INDEX_MASK = (2 << (INDEX_BITS + 1)) - 1;
+constexpr unsigned int INDEX_MASK = (1 << (INDEX_BITS)) - 1;
 
 enum branch_state {
     BRANCH_STATE_NT = -1, 
@@ -34,7 +34,7 @@ void twobitsat::update(uint64_t ip, bool resolveDir) {
     const uint64_t index = ip & INDEX_MASK;
     const branch_state old_state = table[index];
 
-    branch_state new_state = old_state += resolveDir ? 1 : -1;
+    branch_state new_state = static_cast<branch_state>(old_state + (resolveDir ? 1 : -1));
 
     if (new_state < BRANCH_STATE_NT) {
         new_state = BRANCH_STATE_NT;
@@ -43,7 +43,7 @@ void twobitsat::update(uint64_t ip, bool resolveDir) {
         new_state = BRANCH_STATE_T;
     }
 
-    table[index] = new_state;    
+    table[index] = new_state; 
 }
 
 
