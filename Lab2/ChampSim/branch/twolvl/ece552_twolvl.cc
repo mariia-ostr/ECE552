@@ -1,17 +1,18 @@
 #include "twolvl.h"
 
 #define BHT_LEN 512
-#define BHT_BITS 6
+#define HISTORY_BITS 6
+#define BHT_BITS 9
 
 #define PHT_BITS 4
 #define PHT_LEN 16
 
-constexpr uint8_t PHT_ENTRIES = (1 << BHT_BITS);
+constexpr uint8_t PHT_ENTRIES = (1 << HISTORY_BITS);
 
 constexpr uint8_t PHT_MASK = (1 << PHT_BITS) - 1;
 constexpr uint8_t BHT_MASK = (1 << BHT_BITS) - 1;
 
-constexpr uint8_t HISTORY_MASK = (1 << BHT_BITS) - 1;
+constexpr uint8_t HISTORY_MASK = (1 << HISTORY_BITS) - 1;
 
 uint8_t branch_history_table[BHT_LEN];
 uint8_t prediction_history_table[PHT_LEN][PHT_ENTRIES];
@@ -40,7 +41,7 @@ bool twolvl::predict(uint64_t ip) {
         return true;
     }
     
-    return false; 
+    return false;
 }
 
 void twolvl::update(uint64_t ip, bool resolveDir) {
