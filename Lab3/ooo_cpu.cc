@@ -206,9 +206,6 @@ bool O3_CPU::ece552_attempt_issue(const ooo_model_instr& inst)
   // sanity check to make sure we're looking at a correct insn
   assert(inst.scheduled && !inst.executed);
 
-  // check for unresolved RAW hazards (Source Registers)
-  // how to access allocated_rs?
-
   // find this insn in the RSs:
   RS_TYPE* current_rs = nullptr;
   
@@ -314,7 +311,62 @@ store queue, but they do require it to write to the register file.
 
 bool O3_CPU::ece552_attempt_writeback(const ooo_model_instr& inst)
 {
+  // sanity check to make sure we're looking at a correct insn
   assert(inst.executed && !inst.completed);
+
+  // stores (or insns with zero registers) don't need CBD
+  bool needs_cdb = !IS_BRANCH(inst) && (N_DST_REGS(inst) > 0);
+
+  if (needs_cdb) {
+    // writeback only 1 insn per cycle
+    if (last_cdb == CURRENT_CYCLE) {
+      return false; // stall in execute and wait
+    }
+
+    // claim CDB for this cycle
+    last_cdb = CURRENT_CYCLE;
+
+    // broadcast the result over CDB to all 3 RSs:
+
+    for (int i = 0; i < ECE552_AGEN_RS_COUNT; i++) {
+      if (agen_rs[i].id != EMPTY) { // only check occupied stations
+        // look at everything this RS is waiting for
+        for (size_t d = 0; d < agen_rs[i].pending_deps.size(); d++) {
+          if (agen_rs[i].pending_deps[d] == INSTR_ID(inst)) {
+            // found the id, remove it from the waiting list.
+            agen_rs[i].pending_deps.erase(agen_rs[i].pending_deps.begin() + d);
+            break; // move on to the next RS
+          }
+        }
+      }
+    }
+
+    for (int i = 0; i < ECE552_BRANCH_RS_COUNT; i++) {
+      if (agen_rs[i].id != EMPTY) { // only check occupied stations
+        // look at everything this RS is waiting for
+        for (size_t d = 0; d < branch_rs[i].pending_deps.size(); d++) {
+          if (agen_rs[i].pending_deps[d] == INSTR_ID(inst)) {
+            // found the id, remove it from the waiting list.
+            agen_rs[i].pending_deps.erase(agen_rs[i].pending_deps.begin() + d);
+            break; // move on to the next RS
+          }
+        }
+      }
+    }
+
+    for (int i = 0; i < ECE552_ALU_RS_COUNT; i++) {
+      if (agen_rs[i].id != EMPTY) { // only check occupied stations
+        // look at everything this RS is waiting for
+        for (size_t d = 0; d < alu_rs[i].pending_deps.size(); d++) {
+          if (agen_rs[i].pending_deps[d] == INSTR_ID(inst)) {
+            // found the id, remove it from the waiting list.
+            agen_rs[i].pending_deps.erase(agen_rs[i].pending_deps.begin() + d);
+            break; // move on to the next RS
+          }
+        }
+      }
+    }
+  }
   return true;
 }
 
