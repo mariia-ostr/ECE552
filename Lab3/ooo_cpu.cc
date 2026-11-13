@@ -64,14 +64,12 @@
 
 //Suggested data structures:
 typedef uint64_t cycle;
+typedef int16_t REG;
 
 typedef struct {
   uint64_t id;
-  //Anything else to add?
-
-  // track RAW dependencies (instruction IDs of producers we're waiting for)
-  std::vector<uint64_t> pending_deps;
-  
+  std::vector<uint64_t> dependent_tags;
+  cycle cleared;                       // cycle a dependency last cleared (no-forwarding rule)
 } RS_TYPE;
 
 std::array<cycle, ECE552_AGEN_FU_COUNT> agen_fus;
@@ -84,289 +82,162 @@ std::array<RS_TYPE, ECE552_ALU_RS_COUNT> alu_rs;
 
 cycle last_dispatch;
 cycle last_cdb;
+cycle blocked_cycle;                   // a stalled older instr blocks younger ones this cycle
 
 std::array<uint64_t, std::numeric_limits<int16_t>::max()> map_table;
+
+// arch destination regs of each in-flight instruction (so writeback needn't scan the whole map table)
+static std::unordered_map<uint64_t, std::vector<REG>> inflight_dsts;
+// cycle at which each issued instruction finishes execute (emulates per-FU latency)
+static std::unordered_map<uint64_t, cycle> exec_done;
 
 //called once, before anythng else
 void O3_CPU::ece552_init()
 {
-  // initialize last_dispatch and cdb, map table entries, RS table id;s to empty?
-  last_dispatch = 0;
-  last_cdb = 0;
-
-  // map table to EMPTY
-  for (auto& entry : map_table) {
-    entry = EMPTY;
-  }
-
-  // all RSs to EMPTY
-  for (auto& rs : agen_rs) rs.id = EMPTY;
-  for (auto& rs : branch_rs) rs.id = EMPTY;
-  for (auto& rs : alu_rs) rs.id = EMPTY;
-
-  // FUs to cycle 0 (available immediately)
   for (auto& fu : agen_fus) fu = 0;
   for (auto& fu : branch_fus) fu = 0;
   for (auto& fu : alu_fus) fu = 0;
+
+  for (auto& rs : agen_rs)   { rs.id = EMPTY; rs.dependent_tags.clear(); rs.cleared = EMPTY; }
+  for (auto& rs : branch_rs) { rs.id = EMPTY; rs.dependent_tags.clear(); rs.cleared = EMPTY; }
+  for (auto& rs : alu_rs)    { rs.id = EMPTY; rs.dependent_tags.clear(); rs.cleared = EMPTY; }
+
+  for (auto& m : map_table) m = EMPTY;
+
+  last_dispatch = EMPTY;
+  last_cdb = EMPTY;
+  blocked_cycle = EMPTY;
+  inflight_dsts.clear();
+  exec_done.clear();
 }
-
-//Called to determine if the first instruction from the fetch queue can be dispatched to a RS
-//Called multiple times per cycle, but only the first may succeed.
-//Return true if the instruction successfully dispatched by the end of the cycle
-
-/*
-Notes from the assignment:
-- At most one instruction may be dispatched per cycle.
-- A fetched instruction can be dispatched (complete D) if a reservation station entry
-is available this cycle, even if it was just vacated earlier in the same cycle. Structural
-hazards on reservation stations are resolved here with stalls.
-- If there are no stalls, a reservation station entry is allocated based on each instruction’s
-opcode. Any RAW dependences are marked in the reservation entry.
-*/
 
 bool O3_CPU::ece552_attempt_dispatch(const ooo_model_instr& inst)
 {
-  // sanity check to make sure we're looking at a correct insn
   assert(!inst.scheduled);
+  const cycle now = CURRENT_CYCLE;
 
-  // dispatch only 1 insn per cycle
-  if (last_dispatch == CURRENT_CYCLE){
+  // one dispatch per cycle; and if an older instr already failed this cycle, nothing younger may pass it
+  if (now == last_dispatch || now == blocked_cycle) {
     return false;
   }
 
-  // define the insn type and find the RS for it
-  RS_TYPE* allocated_rs = nullptr;
-
-  if (ISMEM(inst)){
-    for (int i = 0; i < ECE552_AGEN_RS_COUNT; i++) {
-      if (agen_rs[i].id == EMPTY) {
-        allocated_rs = &agen_rs[i];
-        break;
-      }
-    }
-  } else if (ISBRANCH(inst)){
-    for (int i = 0; i < ECE552_BRANCH_RS_COUNT; i++) {
-      if (branch_rs[i].id == EMPTY) {
-        allocated_rs = &branch_rs[i];
-        break;
-      }
-    }
-  } else if (ISALU(inst)){
-    for (int i = 0; i < ECE552_ALU_RS_COUNT; i++) {
-      if (alu_rs[i].id == EMPTY) {
-        allocated_rs = &alu_rs[i];
-        break;
-      }
-    }
+  RS_TYPE* free_rs = nullptr;
+  if (IS_MEM(inst)) {
+    for (auto& rs : agen_rs)   if (rs.id == EMPTY) { free_rs = &rs; break; }
+  } else if (IS_BRANCH(inst)) {
+    for (auto& rs : branch_rs) if (rs.id == EMPTY) { free_rs = &rs; break; }
+  } else {
+    for (auto& rs : alu_rs)    if (rs.id == EMPTY) { free_rs = &rs; break; }
   }
 
-  // RS's are full - return false
-  if (allocated_rs == nullptr) {
+  if (free_rs == nullptr) {
+    blocked_cycle = now;               // structural stall: block younger instrs this cycle
     return false;
   }
 
-  // initialize the entries
-  allocated_rs->id = INSTR_ID(inst);
-  allocated_rs->pending_deps.clear();
+  free_rs->id = INSTR_ID(inst);
+  free_rs->dependent_tags.clear();
+  free_rs->cleared = EMPTY;
 
-  // check for RAW hazards (Source Registers)
-  for (std::size_t i = 0; i < N_SRC_REGS(inst); i++) {
-    uint8_t src = SRC_REG(inst, i);
-    if (map_table[src] != EMPTY) {
-      // waiting for some insn
-      allocated_rs->pending_deps.push_back(map_table[src]);
+  // RAW dependences (dedupe so "add r1, r2, r2" holds one tag)
+  for (std::size_t i = 0; i < N_SRC_REGS(inst); ++i) {
+    const REG src = SRC_REG(inst, i);
+    const uint64_t tag = map_table[src];
+    if (tag != EMPTY) {
+      auto& t = free_rs->dependent_tags;
+      if (std::find(t.begin(), t.end(), tag) == t.end()) t.push_back(tag);
     }
   }
 
-  // update map table (Destination Registers)
-  for (std::size_t i = 0; i < N_DST_REGS(inst); i++) {
-    uint8_t dst = DST_REG(inst, i);
+  // claim destinations
+  std::vector<REG> dsts;
+  for (std::size_t i = 0; i < N_DST_REGS(inst); ++i) {
+    const REG dst = DST_REG(inst, i);
     map_table[dst] = INSTR_ID(inst);
+    dsts.push_back(dst);
   }
+  if (!dsts.empty()) inflight_dsts[INSTR_ID(inst)] = std::move(dsts);
 
-  // dispatch successful for this cycle
-  last_dispatch = CURRENT_CYCLE;
+  last_dispatch = now;
   return true;
 }
-
-//Called for each waiting instruction in the order of oldest
-//to youngest each cycle
-//Return true if the instruction successfully issued by the end of the cycle
-
-/*
-Notes from the assignment:
-- Instructions wait at this stage for all RAW hazards to be resolved (i.e., until all source
-operands are marked as ready in their reservation station).
-- Instructions also wait at this stage if no functional unit is available (structural hazard).
-- An instruction spends at least one cycle in this stage (checking for hazards).
-*/
 
 bool O3_CPU::ece552_attempt_issue(const ooo_model_instr& inst)
 {
-  // sanity check to make sure we're looking at a correct insn
   assert(inst.scheduled && !inst.executed);
+  const cycle now = CURRENT_CYCLE;
+  const uint64_t tag = INSTR_ID(inst);
 
-  // find this insn in the RSs:
-  RS_TYPE* current_rs = nullptr;
-  
-  if (IS_MEM(inst)) {
-    // range-declaration : range-expression format
-    // var that's the curr el in each iter : array to iterate over
-    for (auto& rs : agen_rs) {
-      if (rs.id == INSTR_ID(inst)){
-        current_rs = &rs; 
-        break;
+  auto try_issue = [&](auto& rs_arr, auto& fu_arr, int latency) -> bool {
+    RS_TYPE* rs = nullptr;
+    for (auto& r : rs_arr) {
+      if (r.id == tag) { rs = &r; break; }
+    }
+    if (rs == nullptr) return false;
+    if (!rs->dependent_tags.empty()) return false;   // RAW hazard
+    if (rs->cleared == now) return false;            // no forwarding: wait a cycle after wakeup
+
+    for (auto& fu : fu_arr) {
+      if (fu <= now) {                               // FU free
+        fu = now + latency;
+        exec_done[tag] = now + latency;
+        rs->id = EMPTY;                              // free RS entry
+        rs->dependent_tags.clear();
+        rs->cleared = EMPTY;
+        return true;
       }
     }
-  } else if (IS_BRANCH(inst)) {
-    for (auto& rs : branch_rs) {
-      if (rs.id == INSTR_ID(inst)){
-        current_rs = &rs; 
-        break;
-      }
-    }
-  } else if (IS_ALU(inst)) {
-    for (auto& rs : alu_rs) {
-      if (rs.id == INSTR_ID(inst)){
-        current_rs = &rs; 
-        break;
-      }
-    }
-  }
+    return false;                                    // structural hazard
+  };
 
-  // insn not in RS
-  if (current_rs == nullptr) {
-    return false;
-  }
-
-  // still waiting - stall
-  if (!current_rs->pending_deps.empty()) {
-    return false;
-  }
-
-  // allocate the FU if available
-  bool fu_allocated = false;
-  
-  if (IS_MEM(inst)) {
-    for (auto& fu : agen_fus) {
-      if (fu <= CURRENT_CYCLE) {
-        // claim the FU by setting its availability to the future cycle
-        fu = CURRENT_CYCLE + ECE552_AGEN_FU_LATENCY;
-        fu_allocated = true;
-        break;
-      }
-    }
-  } else if (IS_BRANCH(inst)) {
-    for (auto& fu : branch_fus) {
-      if (fu <= CURRENT_CYCLE) {
-        // claim the FU by setting its availability to the future cycle
-        fu = CURRENT_CYCLE + ECE552_AGEN_FU_LATENCY;
-        fu_allocated = true;
-        break;
-      }
-    }
-  } else if (IS_ALU(inst)) {
-    for (auto& fu : alu_fus) {
-      if (fu <= CURRENT_CYCLE) {
-        // claim the FU by setting its availability to the future cycle
-        fu = CURRENT_CYCLE + ECE552_AGEN_FU_LATENCY;
-        fu_allocated = true;
-        break;
-      }
-    }
-  }
-
-  // no FUs available - stall
-  if (!fu_allocated) {
-    return false;
-  }
-
-  // issued, free the RS entry
-  current_rs->id = EMPTY;
-  current_rs->pending_deps.clear();
-
-  return true;
+  if (IS_MEM(inst))    return try_issue(agen_rs,   agen_fus,   ECE552_AGEN_FU_LATENCY);
+  if (IS_BRANCH(inst)) return try_issue(branch_rs, branch_fus, ECE552_BRANCH_FU_LATENCY);
+  return try_issue(alu_rs, alu_fus, ECE552_ALU_FU_LATENCY);
 }
-
-//Called for each issued instruction (except pending loads) in the order of oldest to youngest
-//each cycle
-//Return true if the instruction either won access to the cdb or did not need the cdb
-
-/*
-Notes from the assignment:
-- If an instruction is completing execute, but the CDB unavailable the next cycle, the
-instruction waits in execute.
-- Branch instructions do not require the CDB, even if they have destination registers
-(because the PC counts as a register). They can complete even if the CDB is busy and
-do not block other instructions from using the cdb.
-- Stores and any other instructions without destination registers don't write to CDB.
-These instructions can complete execution even if the CDB is busy, and don't block other 
-instructions from using the CDB.
-- There is no forwarding/bypassing support directly to functional units. If an instruction
-enters issue the same cycle that its RAW hazards are resolved, it still may not enter
-execute until the next cycle.
-- Memory instructions (loads and stores) do not require the CDB to move to the load-
-store queue, but they do require it to write to the register file.
-*/
 
 bool O3_CPU::ece552_attempt_writeback(const ooo_model_instr& inst)
 {
-  // sanity check to make sure we're looking at a correct insn
   assert(inst.executed && !inst.completed);
+  const cycle now = CURRENT_CYCLE;
+  const uint64_t tag = INSTR_ID(inst);
 
-  // stores (or insns with zero registers) don't need CBD
-  bool needs_cdb = !IS_BRANCH(inst) && (N_DST_REGS(inst) > 0);
-
-  if (needs_cdb) {
-    // writeback only 1 insn per cycle
-    if (last_cdb == CURRENT_CYCLE) {
-      return false; // stall in execute and wait
-    }
-
-    // claim CDB for this cycle
-    last_cdb = CURRENT_CYCLE;
-
-    // broadcast the result over CDB to all 3 RSs:
-
-    for (int i = 0; i < ECE552_AGEN_RS_COUNT; i++) {
-      if (agen_rs[i].id != EMPTY) { // only check occupied stations
-        // look at everything this RS is waiting for
-        for (size_t d = 0; d < agen_rs[i].pending_deps.size(); d++) {
-          if (agen_rs[i].pending_deps[d] == INSTR_ID(inst)) {
-            // found the id, remove it from the waiting list.
-            agen_rs[i].pending_deps.erase(agen_rs[i].pending_deps.begin() + d);
-            break; // move on to the next RS
-          }
-        }
-      }
-    }
-
-    for (int i = 0; i < ECE552_BRANCH_RS_COUNT; i++) {
-      if (agen_rs[i].id != EMPTY) { // only check occupied stations
-        // look at everything this RS is waiting for
-        for (size_t d = 0; d < branch_rs[i].pending_deps.size(); d++) {
-          if (agen_rs[i].pending_deps[d] == INSTR_ID(inst)) {
-            // found the id, remove it from the waiting list.
-            agen_rs[i].pending_deps.erase(agen_rs[i].pending_deps.begin() + d);
-            break; // move on to the next RS
-          }
-        }
-      }
-    }
-
-    for (int i = 0; i < ECE552_ALU_RS_COUNT; i++) {
-      if (agen_rs[i].id != EMPTY) { // only check occupied stations
-        // look at everything this RS is waiting for
-        for (size_t d = 0; d < alu_rs[i].pending_deps.size(); d++) {
-          if (agen_rs[i].pending_deps[d] == INSTR_ID(inst)) {
-            // found the id, remove it from the waiting list.
-            agen_rs[i].pending_deps.erase(agen_rs[i].pending_deps.begin() + d);
-            break; // move on to the next RS
-          }
-        }
-      }
-    }
+  // still executing in the FU
+  auto d = exec_done.find(tag);
+  if (d != exec_done.end() && now < d->second) {
+    return false;
   }
+
+  // branches and instrs without destinations don't use the CDB
+  const bool needs_cdb = !IS_BRANCH(inst) && (N_DST_REGS(inst) > 0);
+  if (needs_cdb) {
+    if (last_cdb == now) return false;               // CDB busy: wait in execute
+    last_cdb = now;
+  }
+
+  // wake dependents (all of them, CDB or not)
+  auto wake = [&](auto& arr) {
+    for (auto& rs : arr) {
+      if (rs.id == EMPTY) continue;
+      auto& t = rs.dependent_tags;
+      auto it = std::remove(t.begin(), t.end(), tag);
+      if (it != t.end()) {
+        t.erase(it, t.end());
+        rs.cleared = now;
+      }
+    }
+  };
+  wake(agen_rs); wake(branch_rs); wake(alu_rs);
+
+  // clear map table entries, only if no younger instr has since taken the register
+  auto f = inflight_dsts.find(tag);
+  if (f != inflight_dsts.end()) {
+    for (REG r : f->second) {
+      if (map_table[r] == tag) map_table[r] = EMPTY;
+    }
+    inflight_dsts.erase(f);
+  }
+
+  if (d != exec_done.end()) exec_done.erase(d);
   return true;
 }
 
@@ -992,7 +863,6 @@ long O3_CPU::complete_inflight_instruction()
         && ece552_attempt_writeback(*rob_it)) {
       do_complete_execution(*rob_it);
       complete_bw.consume();
-      break;
     }
   }
 
@@ -1113,13 +983,62 @@ void O3_CPU::print_deadlock()
   };
   std::string_view instr_fmt{
       "instr_id: {} fetch_issued: {} fetch_completed: {} scheduled: {} executed: {} completed: {} num_reg_dependent: {} num_mem_ops: {} event: {}"};
-  champsim::range_print_deadlock(IFETCH_BUFFER, "cpu" + std::to_string(cpu) + "_IFETCH", instr_fmt, instr_pack);
-  champsim::range_print_deadlock(DECODE_BUFFER, "cpu" + std::to_string(cpu) + "_DECODE", instr_fmt, instr_pack);
-  champsim::range_print_deadlock(DISPATCH_BUFFER, "cpu" + std::to_string(cpu) + "_DISPATCH", instr_fmt, instr_pack);
-  champsim::range_print_deadlock(ROB, "cpu" + std::to_string(cpu) + "_ROB", instr_fmt, instr_pack);
+  // champsim::range_print_deadlock(IFETCH_BUFFER, "cpu" + std::to_string(cpu) + "_IFETCH", instr_fmt, instr_pack);
+  // champsim::range_print_deadlock(DECODE_BUFFER, "cpu" + std::to_string(cpu) + "_DECODE", instr_fmt, instr_pack);
+  // champsim::range_print_deadlock(DISPATCH_BUFFER, "cpu" + std::to_string(cpu) + "_DISPATCH", instr_fmt, instr_pack);
+  // champsim::range_print_deadlock(ROB, "cpu" + std::to_string(cpu) + "_ROB", instr_fmt, instr_pack);
 
   // print occupied physical registers
-  reg_allocator.print_deadlock();
+  // reg_allocator.print_deadlock();
+
+  printf("AGEN FUs: ");
+  for (const auto& c : agen_fus) {
+    printf("%x\t", c);
+  }
+  printf("\n");
+
+  printf("Branch FUs: ");
+  for (const auto& c : branch_fus) {
+    printf("%x\t", c);
+  }
+  printf("\n");
+
+  printf("ALU FUs: ");
+  for (const auto& c : alu_fus) {
+    printf("%x\t", c);
+  }
+  printf("\n");
+
+  printf("RESERVATION STATIONS: \n");
+  for (const RS_TYPE& rs: agen_rs) {
+    printf("AGen : id=%d\ttags: ", rs.id);
+    for (const uint64_t tag: rs.dependent_tags) {
+      printf("%lu\t", tag);
+    }
+    printf("\n");
+  }
+  for (const RS_TYPE& rs: branch_rs) {
+    printf("Branch : id=%d\ttags: ", rs.id);
+    for (const uint64_t tag: rs.dependent_tags) {
+      printf("%lu\t", tag);
+    }
+    printf("\n");
+  }
+  for (const RS_TYPE& rs: alu_rs) {
+    printf("ALU : id=%d\ttags: ", rs.id);
+    for (const uint64_t tag: rs.dependent_tags) {
+      printf("%lu\t", tag);
+    }
+    printf("\n");
+  }
+  printf("Last Dispatch: %lu\n", last_dispatch);
+  printf("Last CDB: %lu\n", last_cdb);
+
+  printf("MAP TABLE: \n");
+  for (int i = 0; i < map_table.size(); ++i) {
+    printf("%d, %lu\n", i, map_table[i]);
+  }
+  printf("\n");
 
   // print LQ entry
   auto lq_pack = [period = clock_period](const auto& entry) {
