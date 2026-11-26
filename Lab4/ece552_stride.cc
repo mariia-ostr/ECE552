@@ -19,7 +19,7 @@ struct referencePredictionEntry {
 typedef referencePredictionEntry RPE;
 
 constexpr uint64_t RPT_ENTRY_COUNT = 16;
-constexpr uint64_t RPT_INDEX_MASK = RPT_ENTRY_COUNT - 1;
+constexpr uint64_t RPT_INDEX_MASK = (RPT_ENTRY_COUNT - 1) << 2;
 
 inline uint64_t pc_index(const uint64_t PC) {
 	return PC & RPT_INDEX_MASK;
@@ -72,16 +72,16 @@ void stride::access(uint64_t pc, uint64_t addr, bool hit)
 	const uint64_t tag = pc_tag(pc);
 
 	if (entry->tag != tag) {
-
+		entry->tag = tag;
 		entry->stride = 0;
 		entry->state = rps_init;
 	} else {
-		
-		const uint64_t stride = addr - entry->prev_addr;
-		rpt_fsm_update(entry, stride);
+
+		const uint64_t stride_val = addr - entry->prev_addr;
+		rpt_fsm_update(entry, stride_val);
 
 		if (!(entry->state == rps_disable)) {
-			prefetch(addr + stride);
+			prefetch(addr + stride_val);
 		}
 	}
 	entry->prev_addr = addr;
