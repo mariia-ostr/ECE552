@@ -1,23 +1,17 @@
-// Triangel (Ainsworth & Mukhanov, ISCA 2024, arXiv:2406.10627) behind the
-// openpref interface: openpref::prefetcher_initialize() and
-// openpref::access(pc, addr, hit), issuing prefetches via prefetch(addr).
+// Triangel temporal prefetcher (arXiv:2406.10627) extended with ideas adapted
+// from LINKEY (Maruszewski, arXiv:2505.21669), plus an accuracy-gated stride engine.
 //
-// Implemented from the paper:
-//   - PC-indexed Training Table (LastAddr[0..1], Timestamp, ReuseConf,
-//     2x PatternConf, SampleRate, Lookahead)
-//   - Markov table (single successor + 1 confidence bit, SRRIP replacement)
-//   - History Sampler (2-way) with per-PC adaptive sampling rate
-//   - Second-Chance Sampler (FIFO)
-//   - Confidence-gated storage/prefetch, lookahead-2 and degree-4 when confident
+// v2 changes (targeting llama2 and sssp):
+//  * Stride engine keeps a per-PC "prefetch frontier", so it can run much
+//    deeper (up to 12 blocks ahead) while issuing only 1-2 new prefetches per
+//    access. This targets long streaming scans (llama2 weight matrices,
+//    sssp edge arrays), where degree 4 was too shallow to hide latency.
+//  * A confident stride survives a single outlier delta instead of being
+//    overwritten (row wraps in llama2, vertex changes in sssp).
+//  * Larger outstanding-prefetch tracker for the deeper stride window.
 //
-// Adaptations (the paper assumes a gem5 L2 + partitioned L3 which openpref lacks):
-//   - Markov table is a fixed-size standalone structure, so the Set Dueller
-//     (cache/Markov partition sizing) and the Metadata Reuse Buffer (L3 access
-//     filter) have nothing to act on and are omitted.
-//   - "L2 miss or tagged prefetch hit" becomes "access with hit == false, or an
-//     access to a block this prefetcher previously prefetched".
-//   - A per-PC stride prefetcher is kept alongside, matching the paper's
-//     baseline system (stride at L1 + Triangel).
+// Interface is unchanged: openpref::prefetcher_initialize(),
+// openpref::access(pc, addr, hit), and prefetch(addr).
 
 #include "openpref.h"
 
@@ -33,38 +27,56 @@ constexpr uint64_t BLOCK_OFFSET_BITS = 6;
 // ---- Training table ----
 constexpr size_t TT_ENTRIES = 512;
 
-// ---- Markov table (paper: 1MiB partition; here a fixed 64K-entry table) ----
+// ---- Child-set (Markov) table ----
 constexpr size_t MK_SETS = 4096;
 constexpr size_t MK_WAYS = 16;
-constexpr uint64_t MAX_SIZE = MK_SETS * MK_WAYS; // reuse-distance limit
+constexpr size_t MK_KIDS = 3;
+constexpr uint8_t KCONF_MAX = 3;
+constexpr uint64_t MAX_SIZE = MK_SETS * MK_WAYS;
 
-// ---- History sampler (paper: 512 entries, 2-way) ----
+// ---- History sampler / second-chance sampler ----
 constexpr size_t HS_SETS = 256;
 constexpr size_t HS_WAYS = 2;
 constexpr uint64_t HS_ENTRIES = HS_SETS * HS_WAYS;
-
-// ---- Second-chance sampler (paper: 64 entries, 512-access window) ----
 constexpr size_t SCS_ENTRIES = 64;
 constexpr uint64_t SCS_WINDOW = 512;
 
-// ---- Confidence counters (4-bit saturating, initial value 8) ----
+// ---- Confidence counters ----
 constexpr int CONF_MAX = 15;
 constexpr int CONF_INIT = 8;
 constexpr int SAMPLE_RATE_INIT = 8;
-// BasePatternConf: +1 / -2 (needs > 66% accuracy to exceed 8)
-// HighPatternConf: +1 / -5 (needs > 83% accuracy to exceed 8)
 constexpr int BASE_UP = 1, BASE_DOWN = 2;
 constexpr int HIGH_UP = 1, HIGH_DOWN = 5;
 
-constexpr size_t MAX_DEGREE = 4;
+// ---- Issue limits ----
+constexpr size_t OUT_BUDGET_MAX = 8;
+constexpr size_t OUT_BUDGET_MIN = 2;
+constexpr size_t MAX_BFS_DEPTH = 3;
 
-// ---- Outstanding prefetch tracker (for "tagged prefetch hit" detection) ----
-constexpr size_t PT_ENTRIES = 4096;
+// ---- Accuracy feedback for temporal & stride engines ----
+constexpr uint64_t ACC_EPOCH = 256;
+constexpr double TEMP_ACC_HIGH = 0.45;
+constexpr double TEMP_ACC_LOW = 0.18;
+constexpr double STRIDE_ACC_HIGH = 0.50;
+constexpr double STRIDE_ACC_LOW = 0.25;
 
-// ---- Stride prefetcher (paper's L1 baseline) ----
+// ---- Outstanding prefetch tracker ----
+constexpr size_t PT_ENTRIES = 8192;
+
+enum class PfSource : uint8_t {
+    NONE = 0,
+    TEMPORAL = 1,
+    STRIDE = 2
+};
+
+// ---- Stride engine ----
 constexpr size_t STRIDE_ENTRIES = 512;
-constexpr int64_t MAX_TRACKED_STRIDE = 128;
-constexpr size_t STRIDE_MAX_STEPS = 4;
+constexpr int64_t MAX_TRACKED_STRIDE = 4096; // blocks (256 KiB)
+constexpr size_t STRIDE_DEG_MED = 2;         // conf == 2
+constexpr size_t STRIDE_DEG_HIGH = 8;        // conf == 3, upper bound of adaptive cap
+constexpr size_t STRIDE_DEG_INIT = 6;
+// Keep fully-covered stride streams out of the temporal engine.
+constexpr bool STRIDE_FILTERS_TEMPORAL = false;
 
 inline uint64_t mix64(uint64_t x) {
     x ^= x >> 30;
@@ -85,31 +97,32 @@ inline void conf_down(uint8_t& v, int d) {
 struct TrainEntry {
     bool valid = false;
     uint16_t tag = 0;
-    uint64_t last[2] = {0, 0}; // LastAddr[0] (newest), LastAddr[1]
-    int n_last = 0;            // how many of last[] are valid
-    uint64_t timestamp = 0;    // per-PC access counter
+    uint64_t last[2] = {0, 0};
+    int n_last = 0;
+    uint64_t timestamp = 0;
     uint8_t reuse = CONF_INIT;
-    uint8_t base = CONF_INIT;  // BasePatternConf
-    uint8_t high = CONF_INIT;  // HighPatternConf
+    uint8_t base = CONF_INIT;
+    uint8_t high = CONF_INIT;
     uint8_t sample_rate = SAMPLE_RATE_INIT;
-    bool lookahead = false;    // false: lookahead 1, true: lookahead 2
+    bool lookahead = false;
 };
 
 struct MarkovEntry {
     bool valid = false;
+    bool just_built = false;
     uint16_t tag = 0;
-    uint64_t target = 0; // block address
-    bool conf = false;
     uint8_t rrpv = 3;
+    uint64_t kid[MK_KIDS] = {0, 0, 0};
+    uint8_t kconf[MK_KIDS] = {0, 0, 0};
 };
 
 struct SamplerEntry {
     bool valid = false;
-    uint64_t addr = 0;   // x (LastAddr[0] at sample time)
-    uint64_t target = 0; // y (address that followed x)
+    uint64_t addr = 0;
+    uint64_t target = 0;
     uint32_t train_idx = 0;
-    uint64_t ts = 0;     // per-PC timestamp at sample time
-    uint64_t stamp = 0;  // global recency, for victim selection
+    uint64_t ts = 0;
+    uint64_t stamp = 0;
     bool used = false;
 };
 
@@ -118,12 +131,13 @@ struct ScsEntry {
     uint64_t addr = 0;
     uint32_t train_idx = 0;
     uint16_t pc_tag = 0;
-    uint64_t ts = 0; // global training-event count at insertion
+    uint64_t ts = 0;
 };
 
 struct PrefetchTrack {
     bool valid = false;
     bool used = false;
+    PfSource src = PfSource::NONE;
     uint64_t block = 0;
 };
 
@@ -133,6 +147,10 @@ struct StrideEntry {
     uint64_t last_block = 0;
     int64_t last_stride = 0;
     uint8_t confidence = 0;
+    // Furthest block already prefetched for the current stride run.
+    bool pf_valid = false;
+    int64_t pf_stride = 0;
+    int64_t pf_head = 0;
 };
 
 struct PfBuf {
@@ -150,10 +168,18 @@ struct PfBuf {
     }
 };
 
-struct TriangelState {
-    uint64_t tick = 0;         // global recency counter
-    uint64_t train_count = 0;  // global training-event counter
+struct State {
+    uint64_t tick = 0;
+    uint64_t train_count = 0;
     uint64_t rng = 0x2545F4914F6CDD1DULL;
+
+    uint64_t temp_issued = 0;
+    uint64_t temp_useful = 0;
+    size_t temporal_budget = OUT_BUDGET_MAX;
+
+    uint64_t stride_issued = 0;
+    uint64_t stride_useful = 0;
+    size_t stride_deg_cap = STRIDE_DEG_INIT;
 
     std::array<TrainEntry, TT_ENTRIES> train{};
     std::array<std::array<MarkovEntry, MK_WAYS>, MK_SETS> markov{};
@@ -164,7 +190,7 @@ struct TriangelState {
     std::array<StrideEntry, STRIDE_ENTRIES> stride{};
 };
 
-TriangelState g;
+State g;
 
 inline uint64_t next_rand() {
     g.rng ^= g.rng << 13;
@@ -173,21 +199,14 @@ inline uint64_t next_rand() {
     return g.rng;
 }
 
-// ---------------------------------------------------------------------------
-// Pattern-confidence helpers
-// ---------------------------------------------------------------------------
-
 inline void pattern_up(TrainEntry& te) {
     conf_up(te.base, BASE_UP);
     conf_up(te.high, HIGH_UP);
 }
-
 inline void pattern_down(TrainEntry& te) {
     conf_down(te.base, BASE_DOWN);
     conf_down(te.high, HIGH_DOWN);
 }
-
-// Decrement a PC's pattern confidence by training-table slot, if still resident
 inline void pattern_down_at(uint32_t idx, uint16_t tag) {
     TrainEntry& te = g.train[idx];
     if (te.valid && te.tag == tag) {
@@ -195,35 +214,65 @@ inline void pattern_down_at(uint32_t idx, uint16_t tag) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Prefetch tracker
-// ---------------------------------------------------------------------------
+void adapt_temporal_budget() {
+    if (g.temp_issued < ACC_EPOCH) {
+        return;
+    }
+    double acc = static_cast<double>(g.temp_useful) / static_cast<double>(g.temp_issued);
+    if (acc < TEMP_ACC_LOW) {
+        g.temporal_budget = std::max(OUT_BUDGET_MIN, g.temporal_budget - 2);
+    } else if (acc > TEMP_ACC_HIGH) {
+        g.temporal_budget = std::min(OUT_BUDGET_MAX, g.temporal_budget + 2);
+    }
+    g.temp_issued = 0;
+    g.temp_useful = 0;
+}
 
-// Records an outstanding prefetch. Returns false if it is already outstanding.
-bool pt_issue(uint64_t block) {
+void adapt_stride_degree() {
+    if (g.stride_issued < ACC_EPOCH) {
+        return;
+    }
+    double acc = static_cast<double>(g.stride_useful) / static_cast<double>(g.stride_issued);
+    if (acc < STRIDE_ACC_LOW) {
+        g.stride_deg_cap = (g.stride_deg_cap >= STRIDE_DEG_MED + 2) ? (g.stride_deg_cap - 2) : STRIDE_DEG_MED;
+    } else if (acc > STRIDE_ACC_HIGH) {
+        g.stride_deg_cap = std::min<size_t>(STRIDE_DEG_HIGH, g.stride_deg_cap + 2);
+    }
+    g.stride_issued = 0;
+    g.stride_useful = 0;
+}
+
+bool pt_issue(uint64_t block, PfSource src) {
     PrefetchTrack& e = g.pt[mix64(block) % PT_ENTRIES];
     if (e.valid && e.block == block && !e.used) {
         return false;
     }
     e.valid = true;
     e.used = false;
+    e.src = src;
     e.block = block;
+    if (src == PfSource::TEMPORAL) {
+        ++g.temp_issued;
+    } else if (src == PfSource::STRIDE) {
+        ++g.stride_issued;
+    }
     return true;
 }
 
-// True the first time a prefetched block is demanded ("tagged prefetch hit")
-bool pt_consume(uint64_t block) {
+PfSource pt_consume(uint64_t block) {
     PrefetchTrack& e = g.pt[mix64(block) % PT_ENTRIES];
     if (e.valid && e.block == block && !e.used) {
         e.used = true;
-        return true;
+        PfSource s = e.src;
+        if (s == PfSource::TEMPORAL) {
+            ++g.temp_useful;
+        } else if (s == PfSource::STRIDE) {
+            ++g.stride_useful;
+        }
+        return s;
     }
-    return false;
+    return PfSource::NONE;
 }
-
-// ---------------------------------------------------------------------------
-// Markov table (single successor, 1 confidence bit, SRRIP)
-// ---------------------------------------------------------------------------
 
 inline void markov_locate(uint64_t key, size_t& set, uint16_t& tag) {
     uint64_t h = mix64(key);
@@ -231,41 +280,67 @@ inline void markov_locate(uint64_t key, size_t& set, uint16_t& tag) {
     tag = static_cast<uint16_t>((h >> 40) & 0xFFFF);
 }
 
-bool markov_lookup(uint64_t key, uint64_t& target) {
+MarkovEntry* markov_find(uint64_t key) {
     size_t set;
     uint16_t tag;
     markov_locate(key, set, tag);
     for (auto& e : g.markov[set]) {
         if (e.valid && e.tag == tag) {
-            e.rrpv = 0;
-            target = e.target;
-            return true;
+            return &e;
         }
     }
-    return false;
+    return nullptr;
+}
+
+MarkovEntry* markov_use(uint64_t key) {
+    MarkovEntry* e = markov_find(key);
+    if (e) {
+        e->rrpv = 0;
+        e->just_built = false;
+    }
+    return e;
+}
+
+void learn_kid(MarkovEntry& e, uint64_t target) {
+    for (size_t i = 0; i < MK_KIDS; ++i) {
+        if (e.kconf[i] && e.kid[i] == target) {
+            if (e.kconf[i] < KCONF_MAX) {
+                ++e.kconf[i];
+            }
+            return;
+        }
+    }
+    for (size_t i = 0; i < MK_KIDS; ++i) {
+        if (!e.kconf[i]) {
+            e.kid[i] = target;
+            e.kconf[i] = 1;
+            return;
+        }
+    }
+    size_t w = 0;
+    for (size_t i = 1; i < MK_KIDS; ++i) {
+        if (e.kconf[i] < e.kconf[w]) {
+            w = i;
+        }
+    }
+    if (--e.kconf[w] == 0) {
+        e.kid[w] = target;
+        e.kconf[w] = 1;
+    }
 }
 
 void markov_train(uint64_t key, uint64_t target) {
+    if (MarkovEntry* e = markov_find(key)) {
+        e->rrpv = 0;
+        learn_kid(*e, target);
+        return;
+    }
+
     size_t set;
     uint16_t tag;
     markov_locate(key, set, tag);
     auto& ways = g.markov[set];
 
-    for (auto& e : ways) {
-        if (e.valid && e.tag == tag) {
-            e.rrpv = 0;
-            if (e.target == target) {
-                e.conf = true;
-            } else if (!e.conf) {
-                e.target = target; // replace only when confidence bit is clear
-            } else {
-                e.conf = false;
-            }
-            return;
-        }
-    }
-
-    // Miss: invalid way first, otherwise SRRIP victim (age until rrpv == 3)
     MarkovEntry* victim = nullptr;
     for (auto& e : ways) {
         if (!e.valid) {
@@ -273,34 +348,96 @@ void markov_train(uint64_t key, uint64_t target) {
             break;
         }
     }
-    while (!victim) {
+    for (int round = 0; !victim && round < 4; ++round) {
         for (auto& e : ways) {
-            if (e.rrpv >= 3) {
+            if (e.rrpv >= 3 && !e.just_built) {
                 victim = &e;
                 break;
             }
         }
         if (!victim) {
             for (auto& e : ways) {
-                ++e.rrpv;
+                if (e.rrpv < 3) {
+                    ++e.rrpv;
+                }
             }
         }
     }
+    if (!victim) {
+        for (auto& e : ways) {
+            e.just_built = false;
+        }
+        return;
+    }
+
+    *victim = MarkovEntry{};
     victim->valid = true;
+    victim->just_built = true;
     victim->tag = tag;
-    victim->target = target;
-    victim->conf = false;
-    victim->rrpv = 2; // SRRIP long re-reference insertion
+    victim->rrpv = 2;
+    victim->kid[0] = target;
+    victim->kconf[0] = 1;
 }
 
-// ---------------------------------------------------------------------------
-// Second-Chance Sampler
-// ---------------------------------------------------------------------------
+void issue_children(uint64_t cur, size_t depth_max, size_t budget, uint8_t min_conf,
+                    PfBuf& out) {
+    struct QItem {
+        uint64_t key;
+        size_t depth;
+    };
+    QItem q[16];
+    size_t qh = 0, qt = 0;
+    uint64_t seen[16];
+    size_t ns = 0;
+
+    q[qt++] = {cur, 0};
+    seen[ns++] = cur;
+    size_t issued = 0;
+
+    while (qh < qt && issued < budget) {
+        QItem it = q[qh++];
+        MarkovEntry* e = markov_use(it.key);
+        if (!e) {
+            continue;
+        }
+        uint8_t eff_min = (it.depth == 0) ? min_conf : static_cast<uint8_t>(std::max<int>(2, min_conf));
+        for (int c = KCONF_MAX; c >= static_cast<int>(eff_min) && issued < budget; --c) {
+            for (size_t i = 0; i < MK_KIDS && issued < budget; ++i) {
+                if (e->kconf[i] != c) {
+                    continue;
+                }
+                uint64_t t = e->kid[i];
+                if (t == cur) {
+                    continue;
+                }
+                bool dup = false;
+                for (size_t s = 0; s < ns; ++s) {
+                    if (seen[s] == t) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) {
+                    continue;
+                }
+                if (ns < 16) {
+                    seen[ns++] = t;
+                }
+                if (pt_issue(t, PfSource::TEMPORAL)) {
+                    out.push(t << BLOCK_OFFSET_BITS);
+                    ++issued;
+                }
+                if (it.depth + 1 < depth_max && qt < 16) {
+                    q[qt++] = {t, it.depth + 1};
+                }
+            }
+        }
+    }
+}
 
 void scs_insert(uint64_t addr, uint32_t idx, uint16_t tag) {
     ScsEntry& slot = g.scs[g.scs_head];
     if (slot.valid) {
-        // Left the SCS without being accessed: the prefetch would have been wasted
         pattern_down_at(slot.train_idx, slot.pc_tag);
     }
     slot.valid = true;
@@ -325,10 +462,6 @@ void scs_check(uint32_t idx, TrainEntry& te, uint64_t cur) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// History Sampler
-// ---------------------------------------------------------------------------
-
 SamplerEntry* hs_find(uint64_t addr, uint32_t idx) {
     auto& set = g.hist[mix64(addr) % HS_SETS];
     for (auto& e : set) {
@@ -339,7 +472,6 @@ SamplerEntry* hs_find(uint64_t addr, uint32_t idx) {
     return nullptr;
 }
 
-// probability = SamplerSize / MaxSize * 2^(SampleRate - 8)
 bool should_sample(uint8_t sample_rate) {
     double prob = std::ldexp(static_cast<double>(HS_ENTRIES) / static_cast<double>(MAX_SIZE),
                              static_cast<int>(sample_rate) - SAMPLE_RATE_INIT);
@@ -366,16 +498,14 @@ void hs_insert(uint32_t idx, TrainEntry& te, uint64_t x, uint64_t y) {
 
     if (victim->valid) {
         TrainEntry& vte = g.train[victim->train_idx];
-        bool resident = vte.valid && victim->train_idx < TT_ENTRIES;
+        bool resident = vte.valid;
         bool stale = !resident || (vte.timestamp - victim->ts > MAX_SIZE);
         if (stale) {
-            // Only replacing an old sample: its PC never showed reuse in range
             if (!victim->used && resident) {
                 conf_down(vte.reuse, 1);
             }
             conf_up(te.sample_rate, 1);
         } else if (!victim->used) {
-            // Evicting a still-useful unobserved sample: sample less often
             conf_down(te.sample_rate, 1);
         }
     }
@@ -405,7 +535,6 @@ void history_sample(uint32_t idx, TrainEntry& te, uint64_t cur) {
         if (s->target == cur) {
             pattern_up(te);
         } else {
-            // Not the exact successor; see whether it still shows up soon
             scs_insert(s->target, idx, te.tag);
         }
         s->target = cur;
@@ -419,11 +548,7 @@ void history_sample(uint32_t idx, TrainEntry& te, uint64_t cur) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Triangel core: runs on each training event
-// ---------------------------------------------------------------------------
-
-void triangel_event(uint64_t pc, uint64_t cur, PfBuf& out) {
+void temporal_event(uint64_t pc, uint64_t cur, PfBuf& out) {
     uint64_t h = mix64(pc);
     uint32_t idx = static_cast<uint32_t>(h % TT_ENTRIES);
     uint16_t tag = static_cast<uint16_t>((h >> 48) & 0xFFFF);
@@ -438,19 +563,15 @@ void triangel_event(uint64_t pc, uint64_t cur, PfBuf& out) {
     ++te.timestamp;
     ++g.train_count;
 
-    // Sampling-based classification
     scs_check(idx, te, cur);
     history_sample(idx, te, cur);
 
-    // Lookahead control: 2 when HighPatternConf saturates; back to 1 only when
-    // BasePatternConf falls below its initial value (avoids rapid switching)
     if (te.high >= CONF_MAX) {
         te.lookahead = true;
     } else if (te.lookahead && te.base < CONF_INIT) {
         te.lookahead = false;
     }
 
-    // Store/prefetch only for PCs with proven reuse and > 66% pattern accuracy
     bool confident = te.reuse > CONF_INIT && te.base > CONF_INIT;
 
     if (confident) {
@@ -462,22 +583,13 @@ void triangel_event(uint64_t pc, uint64_t cur, PfBuf& out) {
             }
         }
 
-        // Degree 4 only when HighPatternConf (> 83%) is above its initial value
-        size_t degree = (te.high > CONF_INIT) ? MAX_DEGREE : 1;
-        uint64_t key = cur;
-        for (size_t d = 0; d < degree; ++d) {
-            uint64_t target;
-            if (!markov_lookup(key, target)) {
-                break;
-            }
-            if (target != cur && pt_issue(target)) {
-                out.push(target << BLOCK_OFFSET_BITS);
-            }
-            key = target;
-        }
+        bool strong = te.high > CONF_INIT;
+        size_t depth = strong ? MAX_BFS_DEPTH : 2;
+        uint8_t min_conf = strong ? 1 : 2;
+        issue_children(cur, depth, g.temporal_budget, min_conf, out);
+        adapt_temporal_budget();
     }
 
-    // Shift register
     te.last[1] = te.last[0];
     te.last[0] = cur;
     if (te.n_last < 2) {
@@ -485,11 +597,8 @@ void triangel_event(uint64_t pc, uint64_t cur, PfBuf& out) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Stride prefetcher
-// ---------------------------------------------------------------------------
-
-void stride_event(uint64_t pc, uint64_t addr, PfBuf& out) {
+// Returns true when this access is part of a fully-confident stride stream.
+bool stride_event(uint64_t pc, uint64_t addr, PfBuf& out) {
     uint64_t curr_block = addr >> BLOCK_OFFSET_BITS;
     StrideEntry& e = g.stride[mix64(pc) % STRIDE_ENTRIES];
 
@@ -498,41 +607,71 @@ void stride_event(uint64_t pc, uint64_t addr, PfBuf& out) {
         e.valid = true;
         e.pc = pc;
         e.last_block = curr_block;
-        return;
+        return false;
     }
 
     int64_t delta = static_cast<int64_t>(curr_block) - static_cast<int64_t>(e.last_block);
     e.last_block = curr_block;
     if (delta == 0) {
-        return;
+        return false;
     }
     if (delta > MAX_TRACKED_STRIDE || delta < -MAX_TRACKED_STRIDE) {
         if (e.confidence > 0) {
             --e.confidence;
         }
-        return;
+        e.pf_valid = false;
+        return false;
     }
 
-    if (delta == e.last_stride) {
+    bool matched = (delta == e.last_stride);
+    if (matched) {
         if (e.confidence < 3) {
             ++e.confidence;
         }
+    } else if (e.confidence > 1) {
+        // Established stream hit an outlier (row wrap, new vertex's edge list):
+        // keep the stride, just lose confidence.
+        --e.confidence;
     } else {
         e.last_stride = delta;
-        e.confidence = (e.confidence > 0) ? e.confidence - 1 : 1;
+        e.confidence = 1;
+        e.pf_valid = false;
     }
 
     if (e.confidence < 2 || e.last_stride == 0) {
-        return;
+        return false;
     }
 
-    size_t steps = (e.confidence == 3) ? STRIDE_MAX_STEPS : 2;
-    for (size_t s = 1; s <= steps; ++s) {
-        int64_t target = static_cast<int64_t>(curr_block) + e.last_stride * static_cast<int64_t>(s);
-        if (target > 0) {
-            out.push(static_cast<uint64_t>(target) << BLOCK_OFFSET_BITS);
+    const int64_t stride = e.last_stride;
+    const int64_t cur = static_cast<int64_t>(curr_block);
+    size_t raw_steps = (e.confidence == 3) ? STRIDE_DEG_HIGH : STRIDE_DEG_MED;
+    size_t deg = std::min(raw_steps, g.stride_deg_cap);
+
+    // Resume from the frontier if it is still ahead of us on the same stride.
+    int64_t first = 1;
+    if (e.pf_valid && e.pf_stride == stride) {
+        int64_t ahead = (e.pf_head - cur) / stride;
+        if (ahead > 0 && ahead <= static_cast<int64_t>(STRIDE_DEG_HIGH)) {
+            first = ahead + 1;
         }
     }
+
+    for (int64_t s = first; s <= static_cast<int64_t>(deg); ++s) {
+        int64_t target = cur + stride * s;
+        if (target <= 0) {
+            break;
+        }
+        uint64_t target_block = static_cast<uint64_t>(target);
+        if (pt_issue(target_block, PfSource::STRIDE)) {
+            out.push(target_block << BLOCK_OFFSET_BITS);
+        }
+        e.pf_valid = true;
+        e.pf_stride = stride;
+        e.pf_head = target;
+    }
+    adapt_stride_degree();
+
+    return STRIDE_FILTERS_TEMPORAL && matched && e.confidence == 3;
 }
 
 } // namespace
@@ -543,6 +682,12 @@ void openpref::prefetcher_initialize()
     g.train_count = 0;
     g.rng = 0x2545F4914F6CDD1DULL;
     g.scs_head = 0;
+    g.temp_issued = 0;
+    g.temp_useful = 0;
+    g.temporal_budget = OUT_BUDGET_MAX;
+    g.stride_issued = 0;
+    g.stride_useful = 0;
+    g.stride_deg_cap = STRIDE_DEG_INIT;
 
     for (auto& e : g.train) {
         e = TrainEntry{};
@@ -573,13 +718,15 @@ void openpref::access(uint64_t pc, uint64_t addr, bool hit)
     uint64_t block = addr >> BLOCK_OFFSET_BITS;
     PfBuf out;
 
-    // Training events: a miss, or the first use of a block we prefetched
-    bool tagged_hit = pt_consume(block);
-    if (!hit || tagged_hit) {
-        triangel_event(pc, block, out);
-    }
+    PfSource consumed = pt_consume(block);
 
-    stride_event(pc, addr, out);
+    bool covered = false;
+    if (!hit || consumed == PfSource::STRIDE) {
+        covered = stride_event(pc, addr, out);
+    }
+    if ((!hit || consumed == PfSource::TEMPORAL) && !covered) {
+        temporal_event(pc, block, out);
+    }
 
     for (size_t i = 0; i < out.n; ++i) {
         prefetch(out.a[i]);
